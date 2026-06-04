@@ -1,12 +1,12 @@
-
+cat > claude_telegram_bot.py << 'EOF'
 import logging
 import os
 import anthropic
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+TELEGRAM_TOKEN = 8698014221:AAFs8FDBXbb67mugAVSBIEC-Ks8a_KiAmLMos.getenv("TELEGRAM_TOKEN")
+ANTHROPIC_API_KEY = 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.getenv("ANTHROPIC_API_KEY") 
 SYSTEM_PROMPT = """Sen yordamchi sun'iy intellektsan. O'zbek tilida javob ber."""
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -42,7 +42,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Xato. Qayta urining.")
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build(8698014221:AAFs8FDBXbb67mugAVSBIEC-Ks8a_KiAmLM)
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -51,3 +51,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+EOF
