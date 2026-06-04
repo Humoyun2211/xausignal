@@ -5,7 +5,7 @@ import anthropic
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-TELEGRAM_TOKEN = 8698014221:AAFs8FDBXbb67mugAVSBIEC-Ks8a_KiAmLMos.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = 8698014221:AAGy7rxgZxfxAhv21K-jQxq6rwngO59v3xg.getenv("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = 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.getenv("ANTHROPIC_API_KEY") 
 SYSTEM_PROMPT = """Sen yordamchi sun'iy intellektsan. O'zbek tilida javob ber."""
 
