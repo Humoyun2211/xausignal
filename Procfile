@@ -1,3 +1,1 @@
-
-python-telegram-bot==21.5
-groq>=0.9.0
+web: python claude_telegram_bot.py
