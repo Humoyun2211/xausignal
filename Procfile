@@ -1,1 +1,1 @@
-web: python claude_telegram_bot.py
+worker: python claude_telegram_bot.py
