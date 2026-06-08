@@ -234,7 +234,7 @@ async def get_weather(city: str) -> str:
             f"💨 Shamol: {wind} m/s\n"
             f"📋 Holat: {desc}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
+            f"🕐 {datetime.now(timezone(timedelta(hours=5))).strftime('%H:%M, %d.%m.%Y')} (Toshkent)"
         )
     except Exception as e:
         logger.error(f"Ob-havo xatosi: {e}")
@@ -265,7 +265,8 @@ async def get_currency() -> str:
             f"🇬🇧 GBP: *{gbp:.4f}*\n"
             f"🇯🇵 JPY: *{jpy:.2f}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {datetime.now(timezone(timedelta(hours=5))).strftime('%H:%M, %d.%m.%Y')} (Toshkent)"
+            f"🕐 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
+        )
     except Exception as e:
         logger.error(f"Valyuta xatosi: {e}")
         return "❌ Valyuta ma'lumotini olishda xato."
