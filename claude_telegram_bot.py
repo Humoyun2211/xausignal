@@ -1,5 +1,7 @@
 import logging
 import os
+import sqlite3
+import aiohttp
 from datetime import datetime
 from groq import Groq
 from telegram import (
@@ -23,26 +25,28 @@ from telegram.ext import (
 # =============================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 MODEL = "llama-3.3-70b-versatile"
 MAX_TOKENS = 2048
 MAX_HISTORY = 30
+DB_PATH = "nova_ai.db"
 
-SYSTEM_PROMPT = """Sen XAUUSD Signal botining aqlli AI yordamchisan.
-Ismingiz: Nova AI
+SYSTEM_PROMPT = """Sen Nova AI — eng aqlli Telegram yordamchisan.
 Quyidagilarni bajara olasan:
 - Har qanday savolga javob berish
-- Tarjima qilish
+- Tarjima qilish (100+ til)
 - Kod yozish va tushuntirish
-- Tahlil va maslahat berish
-- Matematik masalalar
-- XAU/USD va moliya haqida ma'lumot berish
+- Moliya va XAU/USD tahlil
+- Matn yozish va tahrirlash
+- Matematik masalalar yechish
 
 Qoidalar:
 - Foydalanuvchi qaysi tilda yozsa, o'sha tilda javob ber
 - Javoblar aniq, qisqa va foydali bo'lsin
-- Emoji ishlatib, xabarlarni chiroyli qil
+- Emoji ishlatib xabarlarni chiroyli qil
 - Doimo do'stona va professional bo'l"""
 
 # =============================================
@@ -55,66 +59,217 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =============================================
-# MA'LUMOTLAR
+# DATABASE
+# =============================================
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        name TEXT,
+        username TEXT,
+        joined TEXT,
+        messages INTEGER DEFAULT 0,
+        mode TEXT DEFAULT 'general',
+        city TEXT DEFAULT 'Tashkent'
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS messages_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        message TEXT,
+        timestamp TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+
+def db_get_user(user_id: int) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "user_id": row[0], "name": row[1], "username": row[2],
+            "joined": row[3], "messages": row[4], "mode": row[5], "city": row[6]
+        }
+    return None
+
+
+def db_save_user(user_id: int, name: str, username: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    existing = db_get_user(user_id)
+    if not existing:
+        c.execute(
+            "INSERT INTO users (user_id, name, username, joined, messages, mode, city) VALUES (?,?,?,?,?,?,?)",
+            (user_id, name, username or "", datetime.now().strftime("%Y-%m-%d %H:%M"), 0, "general", "Tashkent")
+        )
+    else:
+        c.execute("UPDATE users SET name=?, username=? WHERE user_id=?", (name, username or "", user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_increment_messages(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET messages = messages + 1 WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_update_mode(user_id: int, mode: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET mode=? WHERE user_id=?", (mode, user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_update_city(user_id: int, city: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE users SET city=? WHERE user_id=?", (city, user_id))
+    conn.commit()
+    conn.close()
+
+
+def db_get_stats() -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    total_users = c.fetchone()[0]
+    c.execute("SELECT SUM(messages) FROM users")
+    total_messages = c.fetchone()[0] or 0
+    c.execute("SELECT name, messages FROM users ORDER BY messages DESC LIMIT 5")
+    top_users = c.fetchall()
+    conn.close()
+    return {"total_users": total_users, "total_messages": total_messages, "top_users": top_users}
+
+
+# =============================================
+# AI VA XIZMATLAR
 # =============================================
 client = Groq(api_key=GROQ_API_KEY)
 conversation_history: dict[int, list] = {}
-user_stats: dict[int, dict] = {}
-user_modes: dict[int, str] = {}  # foydalanuvchi rejimlari
 bot_start_time = datetime.now()
 
+MODE_PROMPTS = {
+    "general": "Sen Nova AI — universal aqlli yordamchisan. Har qanday mavzuda gaplash.",
+    "finance": "Sen moliya va trading ekspertisan. XAU/USD, valyuta, investitsiya haqida professional maslahat ber.",
+    "coding": "Sen dasturlash ekspertisan. Kod yoz, debug qil, tushuntir. Python, JavaScript, va boshqa tillar.",
+    "translate": "Sen professional tarjimonsan. 100+ tilda aniq va tabiiy tarjima qil.",
+    "writer": "Sen professional yozuvchisan. Maqola, post, story, kreativ matnlar yoz.",
+    "teacher": "Sen sabr-toqatli o'qituvchisan. Har qanday mavzuni oddiy va tushunarli tushuntir.",
+}
 
-# =============================================
-# YORDAMCHI FUNKSIYALAR
-# =============================================
-
-def get_user_stats(user_id: int) -> dict:
-    if user_id not in user_stats:
-        user_stats[user_id] = {
-            "messages": 0,
-            "joined": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "name": "",
-            "username": ""
-        }
-    return user_stats[user_id]
-
-
-def update_stats(user_id: int, user):
-    stats = get_user_stats(user_id)
-    stats["messages"] += 1
-    stats["name"] = user.first_name
-    stats["username"] = f"@{user.username}" if user.username else "Yo'q"
+MODE_NAMES = {
+    "general": "💬 Umumiy",
+    "finance": "📈 Moliya",
+    "coding": "💻 Dasturlash",
+    "translate": "🌐 Tarjimon",
+    "writer": "✍️ Yozuvchi",
+    "teacher": "📚 O'qituvchi",
+}
 
 
-def get_groq_response(user_id: int, user_message: str) -> str:
+def get_groq_response(user_id: int, user_message: str, mode: str = "general") -> str:
     if user_id not in conversation_history:
         conversation_history[user_id] = []
 
-    conversation_history[user_id].append({
-        "role": "user",
-        "content": user_message
-    })
+    conversation_history[user_id].append({"role": "user", "content": user_message})
 
     if len(conversation_history[user_id]) > MAX_HISTORY:
         conversation_history[user_id] = conversation_history[user_id][-MAX_HISTORY:]
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history[user_id]
+    system = MODE_PROMPTS.get(mode, SYSTEM_PROMPT)
+    messages = [{"role": "system", "content": system}] + conversation_history[user_id]
 
     response = client.chat.completions.create(
         model=MODEL,
         messages=messages,
         max_tokens=MAX_TOKENS,
         temperature=0.7,
-        top_p=0.9,
     )
 
     assistant_message = response.choices[0].message.content
-    conversation_history[user_id].append({
-        "role": "assistant",
-        "content": assistant_message
-    })
-
+    conversation_history[user_id].append({"role": "assistant", "content": assistant_message})
     return assistant_message
+
+
+async def get_weather(city: str) -> str:
+    try:
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+
+        if data.get("cod") != 200:
+            return f"❌ '{city}' shahri topilmadi."
+
+        name = data["name"]
+        country = data["sys"]["country"]
+        temp = data["main"]["temp"]
+        feels = data["main"]["feels_like"]
+        humidity = data["main"]["humidity"]
+        wind = data["wind"]["speed"]
+        desc = data["weather"][0]["description"].capitalize()
+        icon_map = {
+            "Clear": "☀️", "Clouds": "☁️", "Rain": "🌧️",
+            "Snow": "❄️", "Thunderstorm": "⛈️", "Drizzle": "🌦️",
+            "Mist": "🌫️", "Fog": "🌫️"
+        }
+        main_weather = data["weather"][0]["main"]
+        icon = icon_map.get(main_weather, "🌤️")
+
+        return (
+            f"{icon} *{name}, {country}*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🌡 Harorat: *{temp:.1f}°C*\n"
+            f"🤔 His qilinadi: {feels:.1f}°C\n"
+            f"💧 Namlik: {humidity}%\n"
+            f"💨 Shamol: {wind} m/s\n"
+            f"📋 Holat: {desc}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
+        )
+    except Exception as e:
+        logger.error(f"Ob-havo xatosi: {e}")
+        return "❌ Ob-havo ma'lumotini olishda xato."
+
+
+async def get_currency() -> str:
+    try:
+        url = f"https://v6.exchangerate-api.com/v6/{EXCHANGE_API_KEY}/latest/USD"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+
+        rates = data["conversion_rates"]
+        uzs = rates.get("UZS", 0)
+        rub = rates.get("RUB", 0)
+        eur = rates.get("EUR", 0)
+        gbp = rates.get("GBP", 0)
+        jpy = rates.get("JPY", 0)
+
+        return (
+            f"💱 *Valyuta Kurslari*\n"
+            f"_(1 USD ga nisbatan)_\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🇺🇿 UZS: *{uzs:,.0f}* so'm\n"
+            f"🇷🇺 RUB: *{rub:.2f}* rubl\n"
+            f"🇪🇺 EUR: *{eur:.4f}*\n"
+            f"🇬🇧 GBP: *{gbp:.4f}*\n"
+            f"🇯🇵 JPY: *{jpy:.2f}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
+        )
+    except Exception as e:
+        logger.error(f"Valyuta xatosi: {e}")
+        return "❌ Valyuta ma'lumotini olishda xato."
 
 
 # =============================================
@@ -128,11 +283,12 @@ def main_inline_keyboard():
             InlineKeyboardButton("📊 Statistika", callback_data="stats"),
         ],
         [
-            InlineKeyboardButton("🧠 Rejimlar", callback_data="modes"),
-            InlineKeyboardButton("ℹ️ Haqida", callback_data="about"),
+            InlineKeyboardButton("🌤 Ob-havo", callback_data="weather"),
+            InlineKeyboardButton("💱 Valyuta", callback_data="currency"),
         ],
         [
-            InlineKeyboardButton("📞 Yordam", callback_data="help"),
+            InlineKeyboardButton("🧠 Rejimlar", callback_data="modes"),
+            InlineKeyboardButton("ℹ️ Haqida", callback_data="about"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -152,62 +308,65 @@ def modes_keyboard():
             InlineKeyboardButton("✍️ Yozuvchi", callback_data="mode_writer"),
             InlineKeyboardButton("📚 O'qituvchi", callback_data="mode_teacher"),
         ],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def weather_keyboard():
+    keyboard = [
         [
-            InlineKeyboardButton("⬅️ Orqaga", callback_data="back_main"),
+            InlineKeyboardButton("🏙 Shahrimni o'zgartirish", callback_data="set_city"),
         ],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
 def reply_keyboard():
     keyboard = [
-        [KeyboardButton("🔄 Yangi suhbat"), KeyboardButton("📊 Statistika")],
-        [KeyboardButton("🧠 Rejimlar"), KeyboardButton("ℹ️ Haqida")],
+        [KeyboardButton("🌤 Ob-havo"), KeyboardButton("💱 Valyuta")],
+        [KeyboardButton("🧠 Rejimlar"), KeyboardButton("📊 Statistika")],
+        [KeyboardButton("🔄 Yangi suhbat"), KeyboardButton("ℹ️ Haqida")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
 # =============================================
-# START
+# KOMANDALAR
 # =============================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     conversation_history[user.id] = []
-    get_user_stats(user.id)
-    user_stats[user.id]["name"] = user.first_name
-    user_modes[user.id] = "general"
-
+    db_save_user(user.id, user.first_name, user.username)
     logger.info(f"Start: {user.first_name} ({user.id})")
 
-    welcome_text = (
+    welcome = (
         f"✨ *Xush kelibsiz, {user.first_name}!*\n\n"
         f"🤖 Men *Nova AI* — sizning aqlli yordamchingizman!\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 *Nima qila olaman?*\n\n"
-        f"• 💬 Har qanday savolga javob\n"
-        f"• 🌐 Tarjima (100+ til)\n"
-        f"• 💻 Kod yozish va debug\n"
-        f"• 📈 Moliya va XAU/USD\n"
-        f"• 📝 Matn yozish\n"
-        f"• 🧮 Matematik masalalar\n\n"
+        f"⚡ *Imkoniyatlarim:*\n\n"
+        f"💬 Har qanday savolga javob\n"
+        f"🌐 100+ tilda tarjima\n"
+        f"💻 Kod yozish va debug\n"
+        f"📈 Moliya va XAU/USD tahlil\n"
+        f"🌤 Real vaqt ob-havo\n"
+        f"💱 Valyuta kurslari\n"
+        f"📝 Matn yozish\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 *Komandalar:*\n"
-        f"/start — Boshlash\n"
-        f"/reset — Yangi suhbat\n"
-        f"/help — Yordam\n"
-        f"/stats — Statistika\n"
-        f"/about — Haqida\n"
-        f"/mode — Rejim tanlash\n\n"
-        f"_Savolingizni yozing yoki pastdagi tugmalardan foydalaning_ 👇"
+        f"/start /reset /help\n"
+        f"/stats /about /mode\n"
+        f"/weather /currency\n\n"
+        f"_Savolingizni yozing yoki tugmalardan foydalaning_ 👇"
     )
 
     await update.message.reply_text(
-        welcome_text,
+        welcome,
         parse_mode="Markdown",
         reply_markup=reply_keyboard()
     )
-
     await update.message.reply_text(
         "🎛 *Boshqaruv paneli:*",
         parse_mode="Markdown",
@@ -215,41 +374,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# =============================================
-# KOMANDALAR
-# =============================================
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
+    await update.message.reply_text(
         "📋 *Yordam markazi*\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🔹 *Asosiy komandalar:*\n\n"
+        "🔹 *Komandalar:*\n\n"
         "/start — Botni boshlash\n"
-        "/reset — Suhbat tarixini tozalash\n"
-        "/help — Ushbu yordam\n"
-        "/stats — Sizning statistikangiz\n"
-        "/about — Bot haqida\n"
-        "/mode — Rejim tanlash\n\n"
+        "/reset — Yangi suhbat\n"
+        "/weather — Ob-havo\n"
+        "/currency — Valyuta kurslari\n"
+        "/mode — Rejim tanlash\n"
+        "/stats — Statistika\n"
+        "/about — Bot haqida\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "💡 *Maslahatlar:*\n\n"
-        "• Savolni to'liq va aniq yozing\n"
-        "• Tarjima uchun: _'Tarjima qil: [matn]'_\n"
-        "• Kod uchun: _'Python da qanday...'_\n"
-        "• /reset bilan yangi mavzu boshlang\n\n"
+        "• Ob-havo: `/weather London`\n"
+        "• Tarjima: `Tarjima qil: salom`\n"
+        "• Kod: `Python da list yoz`\n"
+        "• /reset — yangi mavzu uchun\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🌐 *Qo'llab-quvvatlanadigan tillar:*\n"
-        "O'zbek 🇺🇿 | Rus 🇷🇺 | Ingliz 🇬🇧 va boshqalar"
-    )
-    await update.message.reply_text(
-        help_text,
+        "🌐 O'zbek 🇺🇿 | Rus 🇷🇺 | Ingliz 🇬🇧",
         parse_mode="Markdown",
         reply_markup=main_inline_keyboard()
     )
 
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    conversation_history[user.id] = []
+    conversation_history[update.effective_user.id] = []
     await update.message.reply_text(
         "🔄 *Suhbat tarixi tozalandi!*\n\n"
         "✅ Yangi suhbat boshlashingiz mumkin.\n"
@@ -259,65 +410,74 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_data = db_get_user(user.id)
+    city = " ".join(context.args) if context.args else (user_data["city"] if user_data else "Tashkent")
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    result = await get_weather(city)
+    await update.message.reply_text(
+        result,
+        parse_mode="Markdown",
+        reply_markup=weather_keyboard()
+    )
+
+
+async def currency_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    result = await get_currency()
+    await update.message.reply_text(
+        result,
+        parse_mode="Markdown",
+        reply_markup=main_inline_keyboard()
+    )
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    stats = get_user_stats(user.id)
+    user_data = db_get_user(user.id)
     history_count = len(conversation_history.get(user.id, []))
-    mode = user_modes.get(user.id, "general")
+    mode = user_data["mode"] if user_data else "general"
     uptime = datetime.now() - bot_start_time
 
-    mode_names = {
-        "general": "💬 Umumiy",
-        "finance": "📈 Moliya",
-        "coding": "💻 Dasturlash",
-        "translate": "🌐 Tarjimon",
-        "writer": "✍️ Yozuvchi",
-        "teacher": "📚 O'qituvchi"
-    }
-
-    stats_text = (
+    await update.message.reply_text(
         f"📊 *Sizning statistikangiz*\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 Ism: *{user.first_name}*\n"
         f"🆔 ID: `{user.id}`\n"
-        f"📅 Qo'shilgan: {stats['joined']}\n"
-        f"💬 Jami xabarlar: *{stats['messages']}*\n"
+        f"📅 Qo'shilgan: {user_data['joined'] if user_data else '-'}\n"
+        f"💬 Jami xabarlar: *{user_data['messages'] if user_data else 0}*\n"
         f"🧠 Xotirada: {history_count} xabar\n"
-        f"🎯 Joriy rejim: {mode_names.get(mode, '💬 Umumiy')}\n"
+        f"🎯 Rejim: {MODE_NAMES.get(mode, '💬 Umumiy')}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 *Bot holati:*\n"
         f"⚡ Model: `{MODEL}`\n"
-        f"🕐 Ishlash: {int(uptime.total_seconds()//3600)}s {int((uptime.total_seconds()%3600)//60)}d\n"
-        f"👥 Foydalanuvchilar: {len(user_stats)}"
-    )
-
-    await update.message.reply_text(
-        stats_text,
+        f"🕐 Bot ishlayapti: {int(uptime.total_seconds()//3600)}s {int((uptime.total_seconds()%3600)//60)}d",
         parse_mode="Markdown",
         reply_markup=main_inline_keyboard()
     )
 
 
 async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    about_text = (
-        "ℹ️ *Nova AI haqida*\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 *Nova AI* — zamonaviy sun'iy intellekt yordamchisi\n\n"
-        "⚡ *Texnologiyalar:*\n"
-        f"• Model: `{MODEL}`\n"
-        "• Platform: Groq AI\n"
-        "• Framework: python-telegram-bot\n\n"
-        "🎯 *Imkoniyatlar:*\n"
-        "• Tez va aniq javoblar\n"
-        "• Ko'p tilli muloqot\n"
-        "• Suhbat xotirasi\n"
-        "• 6 xil rejim\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "📌 Versiya: *3.0.0*\n"
-        "🔄 Yangilangan: 2026"
-    )
+    stats = db_get_stats()
+    uptime = datetime.now() - bot_start_time
+
     await update.message.reply_text(
-        about_text,
+        f"ℹ️ *Nova AI haqida*\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 *Nova AI v3.0* — zamonaviy AI yordamchi\n\n"
+        f"⚡ *Texnologiyalar:*\n"
+        f"• AI: `{MODEL}`\n"
+        f"• Platform: Groq AI\n"
+        f"• Ob-havo: OpenWeatherMap\n"
+        f"• Valyuta: ExchangeRate API\n"
+        f"• Baza: SQLite\n\n"
+        f"📊 *Umumiy statistika:*\n"
+        f"• Foydalanuvchilar: {stats['total_users']}\n"
+        f"• Jami xabarlar: {stats['total_messages']}\n"
+        f"• Ishlash vaqti: {int(uptime.total_seconds()//3600)}s\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 Versiya: *3.0.0* | 2026",
         parse_mode="Markdown",
         reply_markup=main_inline_keyboard()
     )
@@ -326,7 +486,12 @@ async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🧠 *Rejim tanlang:*\n\n"
-        "Har bir rejim botni o'sha sohaga moslaydi:",
+        "• 💬 Umumiy — Har qanday mavzu\n"
+        "• 📈 Moliya — XAU/USD, investitsiya\n"
+        "• 💻 Dasturlash — Kod yozish\n"
+        "• 🌐 Tarjimon — Tarjima\n"
+        "• ✍️ Yozuvchi — Matn yozish\n"
+        "• 📚 O'qituvchi — O'qitish",
         parse_mode="Markdown",
         reply_markup=modes_keyboard()
     )
@@ -338,25 +503,21 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ruxsat yo'q!")
         return
 
-    total_messages = sum(s.get("messages", 0) for s in user_stats.values())
+    stats = db_get_stats()
     uptime = datetime.now() - bot_start_time
 
-    admin_text = (
-        f"👑 *Admin Panel*\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👥 Foydalanuvchilar: *{len(user_stats)}*\n"
-        f"💬 Jami xabarlar: *{total_messages}*\n"
-        f"🤖 Faol suhbatlar: *{len([h for h in conversation_history.values() if h])}*\n"
-        f"🕐 Ishlash vaqti: {int(uptime.total_seconds()//3600)}s\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 *So'nggi foydalanuvchilar:*\n"
-    )
-
-    for uid, stats in list(user_stats.items())[-5:]:
-        admin_text += f"• {stats['name']} — {stats['messages']} xabar\n"
+    top_text = ""
+    for name, msgs in stats["top_users"]:
+        top_text += f"• {name}: {msgs} xabar\n"
 
     await update.message.reply_text(
-        admin_text,
+        f"👑 *Admin Panel*\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Foydalanuvchilar: *{stats['total_users']}*\n"
+        f"💬 Jami xabarlar: *{stats['total_messages']}*\n"
+        f"🤖 Faol suhbatlar: *{len([h for h in conversation_history.values() if h])}*\n"
+        f"🕐 Ishlash: {int(uptime.total_seconds()//3600)}s\n\n"
+        f"🏆 *Top foydalanuvchilar:*\n{top_text}",
         parse_mode="Markdown"
     )
 
@@ -370,15 +531,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user = query.from_user
 
-    mode_prompts = {
-        "mode_general": ("general", "💬 Umumiy", "Har qanday mavzuda gaplasha olasan."),
-        "mode_finance": ("finance", "📈 Moliya", "Moliya, XAU/USD, investitsiya eksperti sifatida javob ber."),
-        "mode_coding": ("coding", "💻 Dasturlash", "Dasturlash eksperti sifatida kod yoz va tushuntir."),
-        "mode_translate": ("translate", "🌐 Tarjimon", "Professional tarjimon sifatida xizmat ko'rsat."),
-        "mode_writer": ("writer", "✍️ Yozuvchi", "Professional yozuvchi sifatida matnlar yoz."),
-        "mode_teacher": ("teacher", "📚 O'qituvchi", "Sabr-toqatli o'qituvchi sifatida tushuntir."),
-    }
-
     if query.data == "reset":
         conversation_history[user.id] = []
         await query.edit_message_text(
@@ -388,14 +540,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif query.data == "stats":
-        stats = get_user_stats(user.id)
+        user_data = db_get_user(user.id)
         history_count = len(conversation_history.get(user.id, []))
         await query.edit_message_text(
             f"📊 *Statistika:*\n\n"
             f"👤 {user.first_name}\n"
-            f"💬 Xabarlar: *{stats['messages']}*\n"
+            f"💬 Xabarlar: *{user_data['messages'] if user_data else 0}*\n"
             f"🧠 Xotirada: {history_count} xabar\n"
-            f"📅 {stats['joined']}",
+            f"🎯 Rejim: {MODE_NAMES.get(user_data['mode'] if user_data else 'general', '💬 Umumiy')}",
+            parse_mode="Markdown",
+            reply_markup=main_inline_keyboard()
+        )
+
+    elif query.data == "weather":
+        user_data = db_get_user(user.id)
+        city = user_data["city"] if user_data else "Tashkent"
+        result = await get_weather(city)
+        await query.edit_message_text(
+            result,
+            parse_mode="Markdown",
+            reply_markup=weather_keyboard()
+        )
+
+    elif query.data == "currency":
+        result = await get_currency()
+        await query.edit_message_text(
+            result,
             parse_mode="Markdown",
             reply_markup=main_inline_keyboard()
         )
@@ -413,46 +583,35 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=modes_keyboard()
         )
 
-    elif query.data in mode_prompts:
-        mode_key, mode_name, mode_desc = mode_prompts[query.data]
-        user_modes[user.id] = mode_key
+    elif query.data.startswith("mode_"):
+        mode_key = query.data.replace("mode_", "")
+        db_update_mode(user.id, mode_key)
         conversation_history[user.id] = []
-
-        global SYSTEM_PROMPT
-        base_prompt = f"""Sen Nova AI — aqlli yordamchisan.
-Joriy rejim: {mode_name}
-{mode_desc}
-Foydalanuvchi qaysi tilda yozsa, o'sha tilda javob ber.
-Emoji ishlatib, xabarlarni chiroyli qil."""
-
+        mode_name = MODE_NAMES.get(mode_key, "💬 Umumiy")
         await query.edit_message_text(
             f"✅ *{mode_name} rejimi faollashtirildi!*\n\n"
-            f"_{mode_desc}_\n\n"
+            f"_{MODE_PROMPTS.get(mode_key, '')}_\n\n"
             f"Suhbat tarixi tozalandi. Boshlang! 💪",
             parse_mode="Markdown",
             reply_markup=main_inline_keyboard()
         )
 
-    elif query.data == "about":
+    elif query.data == "set_city":
+        context.user_data["waiting_city"] = True
         await query.edit_message_text(
-            f"ℹ️ *Nova AI haqida:*\n\n"
-            f"🤖 Model: `{MODEL}`\n"
-            f"⚡ Groq AI\n"
-            f"👥 Foydalanuvchilar: {len(user_stats)}\n"
-            f"📌 Versiya: 3.0.0",
-            parse_mode="Markdown",
-            reply_markup=main_inline_keyboard()
+            "🏙 *Shahar nomini yozing:*\n\n"
+            "_Masalan: Tashkent, Moscow, London_",
+            parse_mode="Markdown"
         )
 
-    elif query.data == "help":
+    elif query.data == "about":
+        stats = db_get_stats()
         await query.edit_message_text(
-            "📋 *Yordam:*\n\n"
-            "/start — Boshlash\n"
-            "/reset — Yangi suhbat\n"
-            "/mode — Rejim tanlash\n"
-            "/stats — Statistika\n"
-            "/about — Haqida\n\n"
-            "💡 Savolingizni yozing!",
+            f"ℹ️ *Nova AI v3.0*\n\n"
+            f"⚡ Groq AI | SQLite\n"
+            f"👥 {stats['total_users']} foydalanuvchi\n"
+            f"💬 {stats['total_messages']} xabar\n"
+            f"📌 Versiya: 3.0.0",
             parse_mode="Markdown",
             reply_markup=main_inline_keyboard()
         )
@@ -473,7 +632,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_message = update.message.text
 
+    # Shahar kiritish rejimi
+    if context.user_data.get("waiting_city"):
+        context.user_data["waiting_city"] = False
+        db_update_city(user.id, user_message)
+        result = await get_weather(user_message)
+        await update.message.reply_text(
+            f"✅ Shahar saqlandi: *{user_message}*\n\n{result}",
+            parse_mode="Markdown",
+            reply_markup=main_inline_keyboard()
+        )
+        return
+
     # Reply klaviatura tugmalari
+    quick_actions = {
+        "🌤 Ob-havo": weather_command,
+        "💱 Valyuta": currency_command,
+        "📊 Statistika": stats_command,
+        "ℹ️ Haqida": about_command,
+        "🧠 Rejimlar": mode_command,
+    }
+
+    if user_message in quick_actions:
+        await quick_actions[user_message](update, context)
+        return
+
     if user_message == "🔄 Yangi suhbat":
         conversation_history[user.id] = []
         await update.message.reply_text(
@@ -482,38 +665,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_inline_keyboard()
         )
         return
-    elif user_message == "📊 Statistika":
-        await stats_command(update, context)
-        return
-    elif user_message == "🧠 Rejimlar":
-        await mode_command(update, context)
-        return
-    elif user_message == "ℹ️ Haqida":
-        await about_command(update, context)
-        return
 
-    logger.info(f"{user.first_name} ({user.id}): {user_message[:50]}")
-    update_stats(user.id, user)
+    # AI javob
+    db_save_user(user.id, user.first_name, user.username)
+    db_increment_messages(user.id)
+    user_data = db_get_user(user.id)
+    mode = user_data["mode"] if user_data else "general"
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing"
-    )
+    logger.info(f"{user.first_name} ({user.id}) [{mode}]: {user_message[:50]}")
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        response = get_groq_response(user.id, user_message)
-
+        response = get_groq_response(user.id, user_message, mode)
         if len(response) > 4096:
             for i in range(0, len(response), 4096):
                 await update.message.reply_text(response[i:i+4096])
         else:
             await update.message.reply_text(response)
-
     except Exception as e:
         logger.error(f"Xato ({user.id}): {e}")
         await update.message.reply_text(
-            "❌ *Xato yuz berdi!*\n\n"
-            "Iltimos qayta urining yoki /reset bosing.",
+            "❌ *Xato yuz berdi!*\n\nIltimos /reset bosing va qayta urining.",
             parse_mode="Markdown"
         )
 
@@ -534,11 +707,16 @@ def main():
         logger.error("GROQ_API_KEY topilmadi!")
         return
 
+    init_db()
+    logger.info("✅ Database tayyor!")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CommandHandler("weather", weather_command))
+    app.add_handler(CommandHandler("currency", currency_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("about", about_command))
     app.add_handler(CommandHandler("mode", mode_command))
@@ -547,7 +725,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    logger.info("✅ Nova AI Bot ishga tushdi!")
+    logger.info("🚀 Nova AI Bot ishga tushdi!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
