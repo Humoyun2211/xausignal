@@ -673,7 +673,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"{user.first_name} ({user.id}) [{mode}]: {user_message[:50]}")
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="izlanmoqda")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
         response = get_groq_response(user.id, user_message, mode)
