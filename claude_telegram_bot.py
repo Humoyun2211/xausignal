@@ -265,8 +265,7 @@ async def get_currency() -> str:
             f"🇬🇧 GBP: *{gbp:.4f}*\n"
             f"🇯🇵 JPY: *{jpy:.2f}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {datetime.now().strftime('%H:%M, %d.%m.%Y')}"
-        )
+            f"🕐 {datetime.now(timezone(timedelta(hours=5))).strftime('%H:%M, %d.%m.%Y')} (Toshkent)"
     except Exception as e:
         logger.error(f"Valyuta xatosi: {e}")
         return "❌ Valyuta ma'lumotini olishda xato."
@@ -674,7 +673,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"{user.first_name} ({user.id}) [{mode}]: {user_message[:50]}")
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="izlanmoqda")
 
     try:
         response = get_groq_response(user.id, user_message, mode)
